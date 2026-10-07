@@ -1,22 +1,42 @@
 # =============================================================================
-#  TPUv1 - simulation build (PE)
+#  TPUv1 - simulation build
 #
 #  Simulator : Icarus Verilog (iverilog + vvp)
-#  Usage     : cd sim && make [target]
+#  Usage     : cd sim && make [<testbench>] [target]
 #
-#  Targets:
-#    all / run   compile + run the testbench (default)
-#    build       compile only (produces build/pe_tb.vvp)
-#    wave        run and open the VCD in gtkwave
-#    lint        parse/elaborate only, show warnings
-#    clean       remove all build artifacts
+#  Selecting a testbench
+#    make                build + run $(TOP)             (default: pe_tb)
+#    make TOP=<name>     same, explicit
+#    make <name>         build + run an auto-discovered testbench
+#    make list           list discovered testbenches
+#    make regress        run every discovered testbench
+#
+#  Targets
+#    all / run   compile + run                    (default)
+#    build       compile only -> $(SIM_BIN)
+#    compile     alias of build
+#    wave        run, then open the VCD in gtkwave
+#    lint        parse + elaborate only, report warnings
+#    clean       remove $(BUILD_DIR)/
 #    help        show this message
 #
-#  Overridable variables (e.g. `make TOP=foo_tb`):
-#    TOP       top-level testbench module / file stem   (default: pe_tb)
-#    RTL_DIR   directory holding synthesizable sources  (default: ../rtl)
-#    TB_DIR    directory holding testbench sources       (default: ../tb)
-#    IVFLAGS   extra iverilog flags
+#  Variables (override on the command line)
+#    TOP         testbench module / file stem        (default: pe_tb)
+#    RTL_DIR     synthesizable sources               (default: ../rtl)
+#    TB_DIR      testbench sources                   (default: ../tb)
+#    BUILD_DIR   build output directory              (default: build)
+#    EXTRA_SRCS  extra sources appended to the build
+#    IVFLAGS     iverilog flags
+#
+#  Source selection (automatic)
+#    testbench : tb/**/<TOP>.sv (or .v)
+#    RTL       : rtl/**/<stem>.sv where <stem> = <TOP> minus the "_tb" suffix
+#                (e.g. pe_tb -> pe.sv, delay_chain_tb -> delay_chain.sv); if no
+#                such file exists, every RTL source is used instead. This keeps
+#                a testbench buildable even when an unrelated source in the tree
+#                does not compile yet.
+#    Override  : drop a source list in sim/<TOP>.files (one path per line).
+#                Use it for testbenches needing several RTL files, e.g. MXU.
 # =============================================================================
 
 # ---- Tools ------------------------------------------------------------------
@@ -24,11 +44,12 @@ IV      ?= iverilog
 VVP     ?= vvp
 WAVE    ?= gtkwave
 
-# ---- Design / paths ---------------------------------------------------------
+# ---- Paths ------------------------------------------------------------------
 TOP       ?= pe_tb
 RTL_DIR   ?= ../rtl
 TB_DIR    ?= ../tb
 BUILD_DIR ?= build
+FILES_DIR ?= .
 
 SIM_BIN   := $(BUILD_DIR)/$(TOP).vvp
 WAVE_FILE := $(BUILD_DIR)/$(TOP).vcd
@@ -37,13 +58,34 @@ WAVE_FILE := $(BUILD_DIR)/$(TOP).vcd
 IVFLAGS ?= -g2012 -Wall -Wno-timescale
 IVFLAGS += -s $(TOP)                      # force testbench as the root module
 
-# ---- Source discovery -------------------------------------------------------
-RTL_SRCS := $(wildcard $(RTL_DIR)/*.sv) $(wildcard $(RTL_DIR)/*.v)
-TB_SRCS  := $(wildcard $(TB_DIR)/*.sv)  $(wildcard $(TB_DIR)/*.v)
-SRCS     := $(RTL_SRCS) $(TB_SRCS)
+# ---- Auto-discovered testbenches (tb/**/*_tb.sv -> "xxx_tb") ----------------
+TB_TOPS := $(basename $(notdir $(wildcard $(TB_DIR)/*_tb.sv $(TB_DIR)/*/*_tb.sv)))
+
+# ---- Source selection for $(TOP) --------------------------------------------
+STEM      := $(patsubst %_tb,%,$(TOP))
+RTL_ALL   := $(sort $(wildcard $(RTL_DIR)/*.sv  $(RTL_DIR)/*/*.sv \
+                              $(RTL_DIR)/*.v   $(RTL_DIR)/*/*.v))
+RTL_THIS  := $(sort $(wildcard $(RTL_DIR)/$(STEM).sv  $(RTL_DIR)/*/$(STEM).sv \
+                              $(RTL_DIR)/$(STEM).v   $(RTL_DIR)/*/$(STEM).v))
+TOP_FILES := $(FILES_DIR)/$(TOP).files
+TB_SRCS   := $(sort $(wildcard $(TB_DIR)/$(TOP).sv  $(TB_DIR)/*/$(TOP).sv \
+                              $(TB_DIR)/$(TOP).v   $(TB_DIR)/*/$(TOP).v))
+
+ifeq ($(wildcard $(TOP_FILES)),)
+  RTL_SRCS := $(if $(RTL_THIS),$(RTL_THIS),$(RTL_ALL))
+else
+  RTL_SRCS := $(shell cat $(TOP_FILES))
+endif
+
+SRCS := $(RTL_SRCS) $(TB_SRCS) $(EXTRA_SRCS)
+
+ifeq ($(strip $(TB_SRCS)),)
+  $(warning no testbench tb/**/$(TOP).sv found for TOP=$(TOP))
+endif
 
 # =============================================================================
-.PHONY: all run build compile wave lint clean help
+.DEFAULT_GOAL := all
+.PHONY: all run build compile wave lint regress list clean help $(TB_TOPS)
 
 all: run
 
@@ -67,7 +109,27 @@ wave: $(SIM_BIN)
 # ---- Lint (parse + elaborate, no run) ---------------------------------------
 lint:
 	$(IV) $(IVFLAGS) -t null $(SRCS)
-	@echo ">> lint OK"
+	@echo ">> lint OK ($(TOP))"
+
+# ---- Run every discovered testbench -----------------------------------------
+regress: $(TB_TOPS)
+
+$(TB_TOPS):
+	@$(MAKE) --no-print-directory TOP=$@ run
+
+# ---- List discovered testbenches --------------------------------------------
+list:
+	@echo "testbenches under $(TB_DIR):"
+	@for t in $(TB_TOPS); do \
+	  if [ -f $(FILES_DIR)/$$t.files ]; then \
+	    rtl=$$(tr '\n' ' ' < $(FILES_DIR)/$$t.files); \
+	  else \
+	    stem=$${t%_tb}; \
+	    rtl=$$(ls $(RTL_DIR)/$$stem.sv $(RTL_DIR)/*/$$stem.sv 2>/dev/null | tr '\n' ' '); \
+	    [ -z "$$rtl" ] && rtl="<all rtl>"; \
+	  fi; \
+	  printf "  %-18s rtl : %s\n" "$$t" "$$rtl"; \
+	done
 
 # ---- Clean ------------------------------------------------------------------
 clean:
@@ -75,13 +137,17 @@ clean:
 
 # ---- Help -------------------------------------------------------------------
 help:
-	@echo "TPUv1 PE simulation"
+	@echo "TPUv1 simulation"
 	@echo ""
-	@echo "  make            compile and run the testbench"
-	@echo "  make build      compile only -> $(SIM_BIN)"
-	@echo "  make wave       run and open $(WAVE_FILE) in gtkwave"
-	@echo "  make lint       elaborate only, report warnings"
-	@echo "  make clean      remove $(BUILD_DIR)/"
+	@echo "  make                 compile + run TOP ($(TOP))"
+	@echo "  make <tb>            compile + run an auto-discovered testbench"
+	@echo "  make build           compile only -> $(SIM_BIN)"
+	@echo "  make wave            run + open $(WAVE_FILE) in gtkwave"
+	@echo "  make lint            elaborate only, report warnings"
+	@echo "  make regress         run every discovered testbench"
+	@echo "  make list            list discovered testbenches"
+	@echo "  make clean           remove $(BUILD_DIR)/"
 	@echo ""
-	@echo "  variables: TOP=$(TOP) RTL_DIR=$(RTL_DIR) TB_DIR=$(TB_DIR)"
-	@echo "  sources  : $(SRCS)"
+	@echo "  testbenches : $(TB_TOPS)"
+	@echo "  rtl sources : $(RTL_SRCS)"
+	@echo "  tb source   : $(TB_SRCS)"

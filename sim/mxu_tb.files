@@ -1,0 +1,3 @@
+../rtl/mxu/mxu.sv
+../rtl/mxu/pe.sv
+../rtl/mxu/delay_chain.sv
