@@ -1,0 +1,4 @@
+build/
+*.vcd
+*.vvp
+*.fst
