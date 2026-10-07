@@ -37,6 +37,11 @@
 #                does not compile yet.
 #    Override  : drop a source list in sim/<TOP>.files (one path per line).
 #                Use it for testbenches needing several RTL files, e.g. MXU.
+#
+#  Reference model
+#    If tb/**/<TOP>.py exists it is run after the simulation as a Python
+#    reference model over the dumped trace (see tb/mxu/mxu_tb.py) and its
+#    exit status decides PASS/FAIL for the data checks.
 # =============================================================================
 
 # ---- Tools ------------------------------------------------------------------
@@ -51,8 +56,15 @@ TB_DIR    ?= ../tb
 BUILD_DIR ?= build
 FILES_DIR ?= .
 
-SIM_BIN   := $(BUILD_DIR)/$(TOP).vvp
-WAVE_FILE := $(BUILD_DIR)/$(TOP).vcd
+SIM_BIN    := $(BUILD_DIR)/$(TOP).vvp
+WAVE_FILE  := $(BUILD_DIR)/$(TOP).vcd
+TRACE_FILE := $(BUILD_DIR)/$(TOP).trace
+
+# Optional Python reference model living next to the testbench
+# (tb/**/<TOP>.py). When present it runs after the simulation and decides
+# PASS/FAIL from the dumped trace. `make mxu_tb` uses tb/mxu/mxu_tb.py.
+REF_PY  := $(firstword $(wildcard $(TB_DIR)/$(TOP).py $(TB_DIR)/*/$(TOP).py))
+REF_CMD := $(if $(REF_PY),python3 $(REF_PY) $(TRACE_FILE),@true)
 
 # ---- Compile flags ----------------------------------------------------------
 IVFLAGS ?= -g2012 -Wall -Wno-timescale
@@ -97,13 +109,14 @@ $(SIM_BIN): $(SRCS)
 	$(IV) $(IVFLAGS) -o $@ $(SRCS)
 	@echo ">> built $(SIM_BIN)"
 
-# ---- Run --------------------------------------------------------------------
+# ---- Run (simulation + optional Python reference check) ---------------------
 run: $(SIM_BIN)
-	$(VVP) $(SIM_BIN) +wave=$(WAVE_FILE)
+	$(VVP) $(SIM_BIN) +wave=$(WAVE_FILE) +trace=$(TRACE_FILE)
+	$(REF_CMD)
 
 # ---- Waveform ---------------------------------------------------------------
 wave: $(SIM_BIN)
-	$(VVP) $(SIM_BIN) +wave=$(WAVE_FILE)
+	$(VVP) $(SIM_BIN) +wave=$(WAVE_FILE) +trace=$(TRACE_FILE)
 	$(WAVE) $(WAVE_FILE) &
 
 # ---- Lint (parse + elaborate, no run) ---------------------------------------
@@ -151,3 +164,4 @@ help:
 	@echo "  testbenches : $(TB_TOPS)"
 	@echo "  rtl sources : $(RTL_SRCS)"
 	@echo "  tb source   : $(TB_SRCS)"
+	@echo "  ref model   : $(if $(REF_PY),$(REF_PY),<none>)"
