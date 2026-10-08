@@ -4,8 +4,8 @@
 Reads the trace produced by tb/mxu/mxu_tb.sv and compares the observed
 psum_out / psum_out_valid against a model of the intended dataflow:
 
-  * row i : act_in[i] / act_in_valid -> delay_chain(DEPTH=i)
-  * col j : psum_in[j]               -> delay_chain(DEPTH=j)
+  * row i : act_in[i] / act_in_valid -> delay_chain(DEPTH=i)  (i-cycle delay)
+  * col j : psum_in[j]               -> delay_chain(DEPTH=j)  (j-cycle delay)
   * PE(i,j): weight-stationary MAC; act flows left->right, psum top->bottom
   * psum_out[j]    = PE(ROW-1,j).psum_out
     psum_out_valid = AND over j of PE(ROW-1,j).psum_out_valid
@@ -53,9 +53,14 @@ def main():
     ROW, COL = p['ROW'], p['COL']
 
     # ---- reference model state -------------------------------------------
-    adcnt = [0] * ROW; adout = [None] * ROW      # row act   delay chains (DEPTH=i)
-    vdcnt = [0] * ROW; vdout = [None] * ROW      # row valid delay chains (DEPTH=i)
-    pdcnt = [0] * COL; pdout = [None] * COL      # col psum  delay chains (DEPTH=j)
+    # delay chains are DEPTH-stage shift registers (rtl/mxu/delay_chain.sv):
+    # latency = DEPTH, cleared to 0 by rst, DEPTH=0 is a pure wire
+    adpipe = [[0] * i for i in range(ROW)]       # row act   delay lines (DEPTH=i)
+    vdpipe = [[0] * i for i in range(ROW)]       # row valid delay lines (DEPTH=i)
+    pdpipe = [[0] * j for j in range(COL)]       # col psum  delay lines (DEPTH=j)
+    adout  = [None] * ROW
+    vdout  = [None] * ROW
+    pdout  = [None] * COL
 
     w    = [[0] * COL for _ in range(ROW)]       # PE weight_reg
     psum = [[None] * COL for _ in range(ROW)]    # PE psum_out
@@ -85,6 +90,36 @@ def main():
             obs_valid = num(t[k]);                           k += 1
 
             # ---------- one clock of the reference model ----------
+            # Delay chains are DEPTH-stage shift registers with a combinational
+            # tap, so the value a PE samples during this clock is
+            #   DEPTH = 0 -> din        (pure wire)
+            #   DEPTH > 0 -> the value pushed DEPTH clocks ago
+            # and rst clears every stage. They must be evaluated *before* the
+            # PEs, because the PEs sample them in the very same clock.
+            for i in range(ROW):
+                if rst:
+                    adpipe[i] = [0] * i
+                    vdpipe[i] = [0] * i
+                    adout[i] = act_in[i] if i == 0 else 0
+                    vdout[i] = av if i == 0 else 0
+                elif i == 0:
+                    adout[i] = act_in[i]
+                    vdout[i] = av
+                else:
+                    adout[i] = adpipe[i][-1]
+                    vdout[i] = vdpipe[i][-1]
+                    adpipe[i] = [act_in[i]] + adpipe[i][:-1]
+                    vdpipe[i] = [av] + vdpipe[i][:-1]
+            for j in range(COL):
+                if rst:
+                    pdpipe[j] = [0] * j
+                    pdout[j] = psum_in[j] if j == 0 else 0
+                elif j == 0:
+                    pdout[j] = psum_in[j]
+                else:
+                    pdout[j] = pdpipe[j][-1]
+                    pdpipe[j] = [psum_in[j]] + pdpipe[j][:-1]
+
             # weights persist unless rst/load_weight touches them
             n_w    = [row[:] for row in w]
             n_psum = [[None] * COL for _ in range(ROW)]
@@ -116,29 +151,6 @@ def main():
                             n_aout[i][j] = aout[i][j]     # hold
                         n_pov[i][j] = iactv
                         n_aov[i][j] = iactv
-
-            # delay chains (PE state already sampled above)
-            for i in range(ROW):
-                if rst:
-                    adcnt[i] = 0
-                    vdcnt[i] = 0
-                else:
-                    if adcnt[i] < i:
-                        adcnt[i] += 1
-                    else:
-                        adout[i] = act_in[i]
-                    if vdcnt[i] < i:
-                        vdcnt[i] += 1
-                    else:
-                        vdout[i] = av
-            for j in range(COL):
-                if rst:
-                    pdcnt[j] = 0
-                else:
-                    if pdcnt[j] < j:
-                        pdcnt[j] += 1
-                    else:
-                        pdout[j] = psum_in[j]
 
             w, psum, aout, pov, aov = n_w, n_psum, n_aout, n_pov, n_aov
 

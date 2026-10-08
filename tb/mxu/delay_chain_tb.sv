@@ -1,24 +1,27 @@
 //=============================================================================
 // delay_chain self-checking testbench
-// DUT: rtl/mxu/delay_chain.sv
+// DUT: rtl/mxu/delay_chain.sv - DEPTH-stage shift register
 //
 // Contract implemented by the DUT:
-//   * rst = 1  -> counter <= 0, delay_done <= 0   (dout is NOT reset -> holds)
-//   * rst = 0  -> while counter <  DEPTH : counter++, delay_done <= 0, dout holds
-//                 once  counter >= DEPTH : delay_done <= 1, dout <= din
+//   * rst = 1   -> every stage cleared to 0 (so dout = 0 for DEPTH >= 1)
+//   * rst = 0   -> chains[0] <= din, chains[s] <= chains[s-1],
+//                  dout = chains[DEPTH-1]
+//   * DEPTH = 0 -> dout = din (pure wire, rst has no effect on it)
+//   * therefore dout(c) = din(c - DEPTH): a *constant* DEPTH-cycle delay for
+//     a stream. This is what lets a systolic array skew its rows internally;
+//     the older counter-based version only aligned the start of a stream
+//     (after arming it was a plain 1-cycle register).
 //
-//   Effect: after reset is released, dout holds its previous value (undefined
-//   at power-up) for DEPTH cycles and captures din starting on edge DEPTH+1;
-//   from then on dout follows din with a fixed 1-cycle latency. The module
-//   aligns the *start* of a stream - it is NOT a DEPTH-deep shift register.
-//
-// Coverage: five WIDTH=8 instances (DEPTH = 0/1/2/3/8) plus one WIDTH=1
-// instance (DEPTH=2, the way MXU uses it for the valid line), checked against
-// a per-cycle reference model with directed tests, arming-latency checks,
-// reset-hold checks and a randomized stream.
+// Coverage: WIDTH=8 instances with DEPTH = 0/1/2/3/8 plus a WIDTH=1 DEPTH=2
+// instance (the way MXU drives the act-valid line), each compared every cycle
+// against a per-cycle reference model, plus directed checks:
+//   [1] reset clears every stage
+//   [2] step response: a new din reaches dout after DEPTH cycles
+//       (DEPTH = 0 shows it in the same cycle, so the count is 1 there)
+//   [3] randomized stream with periodic resets vs the reference model
 //
 // Self-checking: prints PASS/FAIL, exits non-zero on any mismatch, dumps VCD.
-// Waveform path: +wave=<file>  (default: delay_chain_tb.vcd)
+// Waveform path: +wave=<file>  (default delay_chain_tb.vcd)
 //
 // Every printed check label ends with the exact signal it compares.
 //=============================================================================
@@ -30,6 +33,7 @@ module delay_chain_tb;
     localparam int WIDTH      = 8;
     localparam int N          = 5;    // WIDTH-bit instances, DEPTH = 0,1,2,3,8
     localparam int DEPTH1     = 2;    // WIDTH=1 instance depth
+    localparam int MAXD       = 8;    // deepest line
     localparam int CLK_PERIOD = 10;   // ns
 
     // ---- DUT signals --------------------------------------------------------
@@ -60,48 +64,37 @@ module delay_chain_tb;
     int errors = 0;
     int checks = 0;
 
-    // ---- Reference model state ----------------------------------------------
-    int   ref_counter [N];
-    logic ref_done    [N];
-    logic [WIDTH-1:0] ref_dout [N];
+    // ---- Reference model: one shift register per instance -------------------
+    logic [WIDTH-1:0] pipe      [N][0:MAXD-1];   // stages, pipe[k][0] is newest
+    logic [WIDTH-1:0] ref_dout  [N];
+    logic [0:MAXD-1]  pipe1;
+    logic             ref_dout1;
 
-    int   ref_counter1;
-    logic ref_done1;
-    logic ref_dout1;
-
-    // scratch used by the arming-latency phase
-    int first_def  [N];
+    int first_def [N];                            // step-response measurement
     int first_def1;
 
     // =========================================================================
     //  Reference model
     // =========================================================================
     task automatic model_step(input logic r);
-        if (r) begin
-            for (int i = 0; i < N; i++) begin
-                ref_counter[i] = 0;
-                ref_done[i]    = 1'b0;
+        for (int k = 0; k < N; k++) begin
+            if (r) begin
+                for (int s = 0; s < DEPTHS[k]; s++) pipe[k][s] = '0;
+            end else if (DEPTHS[k] > 0) begin
+                for (int s = DEPTHS[k]-1; s > 0; s--) pipe[k][s] = pipe[k][s-1];
+                pipe[k][0] = din[k];
             end
-            ref_counter1 = 0;
-            ref_done1    = 1'b0;
-        end else begin
-            for (int i = 0; i < N; i++) begin
-                if (ref_counter[i] < DEPTHS[i]) begin
-                    ref_counter[i] = ref_counter[i] + 1;
-                    ref_done[i]    = 1'b0;
-                end else begin
-                    ref_done[i]    = 1'b1;
-                    ref_dout[i]    = din[i];
-                end
-            end
-            if (ref_counter1 < DEPTH1) begin
-                ref_counter1 = ref_counter1 + 1;
-                ref_done1    = 1'b0;
-            end else begin
-                ref_done1    = 1'b1;
-                ref_dout1    = din1;
-            end
+            // DEPTH=0 is a pure wire, so it tracks din even on a reset cycle
+            ref_dout[k] = (DEPTHS[k] == 0) ? din[k] : pipe[k][DEPTHS[k]-1];
         end
+
+        if (r) begin
+            for (int s = 0; s < DEPTH1; s++) pipe1[s] = 1'b0;
+        end else if (DEPTH1 > 0) begin
+            for (int s = DEPTH1-1; s > 0; s--) pipe1[s] = pipe1[s-1];
+            pipe1[0] = din1;
+        end
+        ref_dout1 = (DEPTH1 == 0) ? din1 : pipe1[DEPTH1-1];
     endtask
 
     // drive rst at the falling edge, advance the model, then sample after the
@@ -122,10 +115,10 @@ module delay_chain_tb;
         checks++;
         if (got !== exp) begin
             errors++;
-            $display("  [FAIL] %-40s got=%0d (0x%02h)  exp=%0d (0x%02h)",
+            $display("  [FAIL] %-42s got=%0d (0x%02h)  exp=%0d (0x%02h)",
                      name, got, got, exp, exp);
         end else begin
-            $display("  [PASS] %-40s = %0d (0x%02h)", name, got, got);
+            $display("  [PASS] %-42s = %0d (0x%02h)", name, got, got);
         end
     endtask
 
@@ -133,9 +126,9 @@ module delay_chain_tb;
         checks++;
         if (got !== exp) begin
             errors++;
-            $display("  [FAIL] %-40s got=%b  exp=%b", name, got, exp);
+            $display("  [FAIL] %-42s got=%b  exp=%b", name, got, exp);
         end else begin
-            $display("  [PASS] %-40s = %b", name, got);
+            $display("  [PASS] %-42s = %b", name, got);
         end
     endtask
 
@@ -143,20 +136,20 @@ module delay_chain_tb;
         checks++;
         if (got !== exp) begin
             errors++;
-            $display("  [FAIL] %-40s got=%0d  exp=%0d", name, got, exp);
+            $display("  [FAIL] %-42s got=%0d  exp=%0d", name, got, exp);
         end else begin
-            $display("  [PASS] %-40s = %0d", name, got);
+            $display("  [PASS] %-42s = %0d", name, got);
         end
     endtask
 
     // silent model comparison (only failures are printed)
     task automatic compare_dout(input int cyc);
-        for (int i = 0; i < N; i++) begin
+        for (int k = 0; k < N; k++) begin
             checks++;
-            if (dout[i] !== ref_dout[i]) begin
+            if (dout[k] !== ref_dout[k]) begin
                 errors++;
                 $display("  [FAIL] u%0d.dout (DEPTH=%0d) got=0x%02h exp=0x%02h [cycle %0d]",
-                         i, DEPTHS[i], dout[i], ref_dout[i], cyc);
+                         k, DEPTHS[k], dout[k], ref_dout[k], cyc);
             end
         end
         checks++;
@@ -165,39 +158,6 @@ module delay_chain_tb;
             $display("  [FAIL] uv.dout (WIDTH=1,DEPTH=%0d) got=%b exp=%b [cycle %0d]",
                      DEPTH1, dout1, ref_dout1, cyc);
         end
-    endtask
-
-    task automatic chk_counter(input string name, input logic [31:0] got,
-                               input logic [31:0] exp, input int cyc);
-        checks++;
-        if (got !== exp) begin
-            errors++;
-            $display("  [FAIL] %-20s got=%0d exp=%0d [cycle %0d]", name, got, exp, cyc);
-        end
-    endtask
-
-    task automatic chk_flag(input string name, input logic got,
-                            input logic exp, input int cyc);
-        checks++;
-        if (got !== exp) begin
-            errors++;
-            $display("  [FAIL] %-20s got=%b exp=%b [cycle %0d]", name, got, exp, cyc);
-        end
-    endtask
-
-    task automatic compare_internal(input int cyc);
-        chk_counter("u0.counter",    u0.counter, ref_counter[0], cyc);
-        chk_counter("u1.counter",    u1.counter, ref_counter[1], cyc);
-        chk_counter("u2.counter",    u2.counter, ref_counter[2], cyc);
-        chk_counter("u3.counter",    u3.counter, ref_counter[3], cyc);
-        chk_counter("u4.counter",    u4.counter, ref_counter[4], cyc);
-        chk_counter("uv.counter",    uv.counter, ref_counter1,   cyc);
-        chk_flag("u0.delay_done",    u0.delay_done, ref_done[0], cyc);
-        chk_flag("u1.delay_done",    u1.delay_done, ref_done[1], cyc);
-        chk_flag("u2.delay_done",    u2.delay_done, ref_done[2], cyc);
-        chk_flag("u3.delay_done",    u3.delay_done, ref_done[3], cyc);
-        chk_flag("u4.delay_done",    u4.delay_done, ref_done[4], cyc);
-        chk_flag("uv.delay_done",    uv.delay_done, ref_done1,   cyc);
     endtask
 
     // =========================================================================
@@ -222,13 +182,13 @@ module delay_chain_tb;
     initial begin
         // model / depth table init
         DEPTHS[0] = 0; DEPTHS[1] = 1; DEPTHS[2] = 2; DEPTHS[3] = 3; DEPTHS[4] = 8;
-        for (int i = 0; i < N; i++) begin
-            ref_counter[i] = 0;
-            ref_done[i]    = 1'b0;
-            ref_dout[i]    = 'x;
-            din[i]         = '0;
+        for (int k = 0; k < N; k++) begin
+            for (int s = 0; s < MAXD; s++) pipe[k][s] = 'x;
+            ref_dout[k] = 'x;
+            din[k]      = '0;
         end
-        ref_counter1 = 0; ref_done1 = 1'b0; ref_dout1 = 1'bx;
+        for (int s = 0; s < MAXD; s++) pipe1[s] = 1'bx;
+        ref_dout1 = 1'bx;
         din1 = 1'b0;
         rst  = 1'b0;
 
@@ -237,73 +197,52 @@ module delay_chain_tb;
                  WIDTH, DEPTH1);
         $display("=================================================");
 
-        // ---- [1] Reset ------------------------------------------------------
-        $display("[1] Reset");
+        // ---- [1] Reset clears every stage -----------------------------------
+        $display("[1] Reset clears every stage");
         step(1'b1);
-        check_int("u3.counter",     u3.counter,     0);
-        check_bit("u3.delay_done",  u3.delay_done,  1'b0);
-        check_int("uv.counter",     uv.counter,     0);
-        check_bit("uv.delay_done",  uv.delay_done,  1'b0);
+        for (int k = 0; k < N; k++)
+            check_val($sformatf("u%0d.dout after rst (DEPTH=%0d)", k, DEPTHS[k]),
+                      dout[k], (DEPTHS[k] == 0) ? din[k] : '0);
+        check_bit("uv.dout after rst (DEPTH=2)", dout1, 1'b0);
 
-        // ---- [2] Prime: arm every instance ----------------------------------
-        // dout is only defined once an instance has been armed, so run past the
-        // deepest DEPTH (8) before comparing dout against the model.
-        $display("[2] Arm all instances (u* din = 0x10..0x14, uv din = 1)");
-        for (int c = 1; c <= 11; c++) begin
-            for (int i = 0; i < N; i++) din[i] = 8'h10 + i;
+        // ---- [2] Step response: a new din reaches dout after DEPTH cycles ----
+        // settle at 0 first (a value different from the step), then apply 0x5A;
+        // the first cycle where dout shows 0x5A is the line latency.
+        $display("[2] Step response: din 0 -> 0x5A reaches dout after DEPTH cycles");
+        step(1'b1);
+        for (int c = 0; c < 2; c++) begin
+            for (int k = 0; k < N; k++) din[k] = '0;
+            din1 = 1'b0;
+            step(1'b0);
+        end
+        for (int k = 0; k < N; k++) first_def[k] = -1;
+        first_def1 = -1;
+        for (int c = 1; c <= MAXD + 4; c++) begin
+            for (int k = 0; k < N; k++) din[k] = 8'h5A;
             din1 = 1'b1;
             step(1'b0);
-            compare_internal(c);
-        end
-        for (int i = 0; i < N; i++)
-            check_val($sformatf("u%0d.dout armed value", i), dout[i], 8'h10 + i);
-        check_bit("uv.dout armed value", dout1, 1'b1);
-        check_bit("u4.delay_done armed", u4.delay_done, 1'b1);
-
-        // ---- [3] Reset holds dout, clears counter/delay_done ----------------
-        $display("[3] Reset holds dout, clears counter/delay_done");
-        step(1'b1);
-        for (int i = 0; i < N; i++)
-            check_val($sformatf("u%0d.dout held on rst", i), dout[i], 8'h10 + i);
-        check_bit("uv.dout held on rst", dout1, 1'b1);
-        check_int("u4.counter",    u4.counter,    0);
-        check_bit("u4.delay_done", u4.delay_done, 1'b0);
-
-        // ---- [4] Arming latency: dout starts tracking on edge DEPTH+1 -------
-        // din changes every cycle and never equals the value held through the
-        // arming window, so the first cycle where dout == din is exactly the
-        // cycle the instance starts passing data through.
-        $display("[4] Arming latency: dout starts tracking on edge DEPTH+1");
-        for (int i = 0; i < N; i++) first_def[i] = -1;
-        first_def1 = -1;
-        for (int c = 1; c <= 11; c++) begin
-            for (int i = 0; i < N; i++) din[i] = 8'h80 + c;
-            din1 = 1'b0;                                     // differs from held 1
-            step(1'b0);
-            for (int i = 0; i < N; i++)
-                if (first_def[i] < 0 && (dout[i] === din[i])) first_def[i] = c;
+            for (int k = 0; k < N; k++)
+                if (first_def[k] < 0 && (dout[k] === din[k])) first_def[k] = c;
             if (first_def1 < 0 && (dout1 === din1)) first_def1 = c;
             compare_dout(c);
-            compare_internal(c);
         end
-        for (int i = 0; i < N; i++)
-            check_int($sformatf("u%0d.dout first_tracking_cycle (DEPTH=%0d)", i, DEPTHS[i]),
-                      first_def[i], DEPTHS[i] + 1);
-        check_int($sformatf("uv.dout first_tracking_cycle (DEPTH=%0d)", DEPTH1),
-                  first_def1, DEPTH1 + 1);
+        for (int k = 0; k < N; k++)
+            check_int($sformatf("u%0d.dout step latency (DEPTH=%0d)", k, DEPTHS[k]),
+                      first_def[k], (DEPTHS[k] == 0) ? 1 : DEPTHS[k]);
+        check_int($sformatf("uv.dout step latency (DEPTH=%0d)", DEPTH1),
+                  first_def1, (DEPTH1 == 0) ? 1 : DEPTH1);
 
-        // ---- [5] Randomized stream + periodic reset vs reference model ------
-        $display("[5] Randomized stream + periodic reset vs reference model (300 cycles)");
+        // ---- [3] Randomized stream + periodic reset vs reference model ------
+        $display("[3] Randomized stream + periodic reset vs reference model (300 cycles)");
         for (int c = 0; c < 300; c++) begin
             if (c % 53 == 0) begin
                 step(1'b1);                          // periodic reset
             end else begin
-                for (int i = 0; i < N; i++) din[i] = $urandom;
+                for (int k = 0; k < N; k++) din[k] = $urandom;
                 din1 = $urandom_range(0, 1);
                 step(1'b0);
             end
             compare_dout(c);
-            compare_internal(c);
         end
 
         // ---- Summary --------------------------------------------------------
