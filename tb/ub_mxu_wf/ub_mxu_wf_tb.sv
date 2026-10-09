@@ -1,12 +1,14 @@
 //=============================================================================
 // UB + MXU + WeightFIFO integration testbench
 //
-// DUTs: rtl/ub.sv, rtl/weight_fifo.sv, rtl/mxu/{mxu,pe,delay_chain}.sv
+// DUTs: rtl/ub.sv, rtl/weight_fifo.sv, rtl/weight_reshape.sv,
+//       rtl/mxu/{mxu,pe,delay_chain}.sv
 //
 // Dataflow exercised (the weight / activation path of the TPU):
 //   * one WeightFIFO entry holds a whole ROW x COL weight tile
 //     (WEIGHT_WIDTH*ROW*COL bits); tiles are prefetched into the FIFO, popped
-//     one per round and loaded into the MXU weight ports (load_weight)
+//     one per round, reshaped by WeightReshape into the MXU weight-port layout
+//     and loaded with load_weight
 //   * one activation matrix per round is written into UB (one UB line = one
 //     activation vector = ROW words) and streamed into the MXU act ports, one
 //     vector per cycle (the array skews the rows internally - delay_chain is
@@ -14,8 +16,9 @@
 //   * while round 0 computes, the next weight tile is pushed into the FIFO
 //     (prefetch during compute); the FIFO must hand back the tiles in order
 //   * every round: UB image read back, FIFO entry compared with the golden
-//     tile, waveform model checked cycle by cycle and psum_out compared with
-//     A_round x W_tile at the cycle the wavefront lands
+//     tile, every reshaped weight lane compared with the golden tile, waveform
+//     model checked cycle by cycle and psum_out compared with A_round x W_tile
+//     at the cycle the wavefront lands
 //   * WeightFIFO full/empty transitions are checked on the way
 //
 //   make ub_mxu_wf_tb   -> runs the tb (self-checking; no Python model needed)
@@ -23,6 +26,9 @@
 //
 // Icarus note: psum_out is read as u_mxu.psum_out[j]; an unpacked-array output
 // port does not propagate up to a tb-level copy (same caveat as mxu_tb.sv).
+// For the same reason WeightReshape's dout port is left unconnected and its
+// lanes are copied into the MXU weight_in array through a hierarchical
+// reference (in real RTL this is just .weight_in(u_reshape.dout)).
 //=============================================================================
 `default_nettype none
 `timescale 1ns/1ps
@@ -123,12 +129,22 @@ module ub_mxu_wf_tb;
         .psum_out       (psum_out)
     );
 
-    // ---- weight loader: FIFO entry -> MXU weight ports ----------------------
-    // word (i*COL + j) of the entry drives weight_in[i][j]
+    // ---- weight loader: FIFO entry -> WeightReshape -> MXU weight ports ------
+    WeightReshape #(
+        .WIDTH(WEIGHT_WIDTH), .ROW(ROW), .COL(COL)
+    ) u_reshape (
+        .din  (wf_rd_data),
+        .dout ()
+    );
+
+    // Icarus quirk: an output port that is an unpacked array does not drive a
+    // tb-level array (it would read X), so the reshaped lanes are copied over
+    // through the hierarchy. In real RTL this is a plain wire connection:
+    //     .weight_in(u_reshape.dout)
     always_comb begin
         for (int i = 0; i < ROW; i++)
             for (int j = 0; j < COL; j++)
-                weight_in[i][j] = wf_rd_data[(i*COL + j)*WEIGHT_WIDTH +: WEIGHT_WIDTH];
+                weight_in[i][j] = u_reshape.dout[i][j];
     end
 
     // ---- Golden data / bookkeeping -----------------------------------------
@@ -283,6 +299,26 @@ module ub_mxu_wf_tb;
         edge_in(); wf_wr_en = 1'b0; tick();
     endtask
 
+    // the reshaped lanes must reproduce the golden tile (WeightReshape sits
+    // directly in the weight path now, so it is checked in situ)
+    task automatic check_reshape(input int r);
+        bit bad;
+        bad = 1'b0;
+        checks++;
+        for (int i = 0; i < ROW; i++)
+            for (int j = 0; j < COL; j++)
+                if (u_reshape.dout[i][j] !== WEIGHT_WIDTH'(Wcur[i][j])) begin
+                    bad = 1'b1;
+                    errors++;
+                    if (errors <= 20)
+                        $display("  [FAIL] round %0d WeightReshape lane[%0d][%0d] got=%02h exp=%02h",
+                                 r, i, j, u_reshape.dout[i][j], WEIGHT_WIDTH'(Wcur[i][j]));
+                end
+        if (!bad)
+            $display("  [PASS] round %0d %-38s (%0d lanes)", r,
+                     "WeightReshape tile matches", ROW*COL);
+    endtask
+
     // pop tile r, compare the FIFO output with the golden tile, load it
     task automatic wf_pop_and_load(input int r);
         edge_in();
@@ -290,6 +326,7 @@ module ub_mxu_wf_tb;
         tick();                                  // rd_data = the popped entry
         check_wline($sformatf("round %0d WeightFIFO entry (tile %0d)", r, r),
                     wf_rd_data, pack_w(r));
+        check_reshape(r);                        // FIFO entry -> weight lanes
         edge_in(); wf_rd_en = 1'b0; tick();
         // the entry sits on rd_data / weight_in; pulse load_weight
         edge_in();
