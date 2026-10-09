@@ -21,6 +21,8 @@ module WeightFIFO #(
     localparam LINE_SIZE = WIDTH * DEPTH;
     reg [LINE_SIZE-1:0] fifo [0:TILE-1];
     reg [7:0] fifo_size;
+    localparam int PTRW = ($clog2(TILE) < 1) ? 1 : $clog2(TILE);
+    reg [PTRW-1:0] wr_ptr, rd_ptr;
 
     assign full = (fifo_size == TILE);
     assign empty = (fifo_size == 8'b0);
@@ -32,21 +34,26 @@ module WeightFIFO #(
                 fifo[i] <= {LINE_SIZE{1'b0}};
             end
             fifo_size <= 8'b0;
+            wr_ptr <= 8'b0;
+            rd_ptr <= 8'b0;
         end else begin
             case ({wr_en & ~full, rd_en & ~empty})
                 2'b10: begin
-                    fifo[fifo_size] <= wr_data;
+                    fifo[wr_ptr] <= wr_data;
                     fifo_size <= fifo_size + 1'b1;
+                    wr_ptr <= (wr_ptr == TILE-1) ? 8'b0 : wr_ptr + 1'b1;
                 end
                 2'b01: begin
-                    rd_data <= fifo[0];
-                    for (i = 0; i < fifo_size-1; i=i+1) fifo[i] <= fifo[i+1];
+                    rd_data <= fifo[rd_ptr];
                     fifo_size <= fifo_size - 1'b1;
+                    rd_ptr <= (rd_ptr == TILE-1) ? 8'b0 : rd_ptr + 1'b1;
                 end
                 2'b11: begin
-                    rd_data <= fifo[0];
-                    for (i = 0; i < fifo_size-1; i=i+1) fifo[i] <= fifo[i+1];
-                    fifo[fifo_size-1] <= wr_data;   // 移位腾出的槽位
+                    rd_data <= fifo[rd_ptr];
+                    fifo[wr_ptr] <= wr_data;
+                    wr_ptr <= (wr_ptr == TILE-1) ? 8'b0 : wr_ptr + 1'b1;
+                    rd_ptr <= (rd_ptr == TILE-1) ? 8'b0 : rd_ptr + 1'b1;
+                    // fifo_size is unchanged: one entry leaves, one enters
                 end
             endcase
         end
