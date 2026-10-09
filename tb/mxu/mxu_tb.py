@@ -61,6 +61,12 @@ def main():
     adout  = [None] * ROW
     vdout  = [None] * ROW
     pdout  = [None] * COL
+    # output alignment inside the MXU: column j is the raw bottom-row result
+    # delayed by COL-1-j (a delay_chain per column), so one cycle carries one
+    # whole wavefront. ochain mirrors those flops, oprev is the value the
+    # chain samples (the psum register value in effect during this cycle).
+    ochain = [[0] * (COL - 1 - j) for j in range(COL)]
+    oprev  = [0] * COL
 
     w    = [[0] * COL for _ in range(ROW)]       # PE weight_reg
     psum = [[None] * COL for _ in range(ROW)]    # PE psum_out
@@ -154,16 +160,20 @@ def main():
 
             w, psum, aout, pov, aov = n_w, n_psum, n_aout, n_pov, n_aov
 
-            g_out = [n_psum[ROW - 1][j] for j in range(COL)]
-            g_valid = 1
+            g_out = []
             for j in range(COL):
-                if g_valid == 0:
-                    continue
-                v = n_pov[ROW - 1][j]
-                if v == 0:
-                    g_valid = 0
-                elif v is None:
-                    g_valid = None
+                d = COL - 1 - j
+                if d == 0:
+                    g_out.append(n_psum[ROW - 1][j])
+                else:
+                    if rst:
+                        ochain[j] = [0] * d          # rst clears every stage
+                    else:
+                        ochain[j] = [oprev[j]] + ochain[j][:-1]
+                    g_out.append(ochain[j][-1])
+            # psum_out_valid = last column's bottom-row PE valid (same wavefront)
+            g_valid = n_pov[ROW - 1][COL - 1]
+            oprev = [n_psum[ROW - 1][j] for j in range(COL)]
 
             if not cmp_en:
                 continue

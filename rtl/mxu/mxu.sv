@@ -31,11 +31,9 @@ module MXU #(
     logic [ACC_WIDTH-1:0] psum_wire [0:ROW][0:COL-1];
     logic psum_out_valid_wire [0:ROW-1][0:COL-1];
 
-    always_comb begin
-        psum_out_valid = 1'b1;
-        for (int j = 0; j < COL; j++)
-            psum_out_valid = psum_out_valid & psum_out_valid_wire[ROW-1][j];
-    end
+    // psum_out_valid：与对齐后的 psum_out 同一拍，表示这一拍上 COL 个 psum
+    // 都是同一个 wavefront 的结果（最后一列底部的 PE 算完即全部算完）
+    assign psum_out_valid = psum_out_valid_wire[ROW-1][COL-1];
 
     genvar i, j;
     generate
@@ -82,7 +80,16 @@ module MXU #(
         end
 
         for (j = 0; j < COL; j++) begin : gen_psum_out
-            assign psum_out[j] = psum_wire[ROW][j];
+            // 输出对齐：列 j 延迟 (COL-1-j) 拍，把各列的错拍补平，使同一拍上
+            // 得到一个完整 wavefront 的 COL 个列结果
+            if (j == COL-1) begin : g_pass
+                assign psum_out[j] = psum_wire[ROW][j];
+            end else begin : g_delay
+                delay_chain #(.WIDTH(ACC_WIDTH), .DEPTH(COL-1-j)) out_delay (
+                    .clk(clk), .rst(rst),
+                    .din(psum_wire[ROW][j]), .dout(psum_out[j])
+                );
+            end
         end
 
     endgenerate

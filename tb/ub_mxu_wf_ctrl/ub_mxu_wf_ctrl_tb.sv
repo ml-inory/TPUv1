@@ -25,7 +25,7 @@
 //
 // Checked per round: UB image, reshaped weight lanes, the whole controller
 // protocol (COMPUTE length, one load pulse, done after psum_out_valid drops)
-// and psum_out[j] == dot(A[k][:], W[:,j]) at cycle c0 + k + ROW + j, where c0
+// and psum_out[j] == dot(A[k][:], W[:,j]) at cycle c0 + k + ROW + COL - 1, where c0
 // is the first COMPUTE cycle (interval convention: a value sampled right after
 // the falling edge is the one that lives in that cycle).
 //
@@ -374,21 +374,21 @@ module ub_mxu_wf_ctrl_tb;
         if (gerr == 0)
             $display("  [PASS] %-50s (%0d lanes)", $sformatf("round %0d reshaped weight tile", r), ROW*COL);
 
-        // psum_out[j] at cycle c0 + k + ROW + j == dot(A[k][:], W[:,j])
+        // psum_out[j] at cycle c0 + k + ROW + COL - 1 == dot(A[k][:], W[:,j])
         gerr = 0;
         for (int k = 0; k < K; k++) begin
             for (int j = 0; j < COL; j++) begin
                 acc = 0;
                 for (int i = 0; i < ROW; i++) acc += W[r][i][j] * A[r][k][i];
                 checks++;
-                if ($signed(psum_hist[j][c0 + k + ROW + j]) !== acc) begin
+                if ($signed(psum_hist[j][c0 + k + ROW + COL - 1]) !== acc) begin
                     errors++; gerr++;
                     $display("  [FAIL] round %0d wavefront %0d col %0d (cyc %0d): psum_out=%0d exp=%0d",
-                             r, k, j, c0 + k + ROW + j,
-                             $signed(psum_hist[j][c0 + k + ROW + j]), acc);
+                             r, k, j, c0 + k + ROW + COL - 1,
+                             $signed(psum_hist[j][c0 + k + ROW + COL - 1]), acc);
                 end else begin
                     $display("  [PASS] round %0d wavefront %0d col %0d = %0d (cyc %0d)",
-                             r, k, j, acc, c0 + k + ROW + j);
+                             r, k, j, acc, c0 + k + ROW + COL - 1);
                 end
             end
         end

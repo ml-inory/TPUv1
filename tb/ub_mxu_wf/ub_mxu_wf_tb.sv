@@ -395,7 +395,9 @@ module ub_mxu_wf_tb;
             for (int j = 0; j < COL; j++) begin
                 acc = 0;
                 for (int i = 0; i < ROW; i++)
-                    acc += Wcur[i][j] * $signed(act_hist[i][c + 1 - ROW - j]);
+                    // psum_out is column aligned inside the MXU now, so one
+                    // cycle carries a whole wavefront of all COL columns
+                    acc += Wcur[i][j] * $signed(act_hist[i][c + 2 - ROW - COL]);
                 if ($signed(psum_hist[j][c]) !== acc) begin
                     sb_err++;
                     if (sb_err <= 6)
@@ -416,7 +418,7 @@ module ub_mxu_wf_tb;
                 acc = 0;
                 for (int i = 0; i < ROW; i++) acc += Wcur[i][j] * A[r][k][i];
                 gemm_gold[k][j] = acc;
-                cc = r0 + k + ROW + j;           // dot product lands here
+                cc = r0 + k + ROW + COL - 1;     // aligned wavefront lands here
                 checks++;
                 if ($signed(psum_hist[j][cc]) !== acc || !pvalid_hist[cc]) begin
                     errors++; gerr++;
@@ -434,7 +436,7 @@ module ub_mxu_wf_tb;
         for (int k = 0; k < K; k++) begin
             $write("         wavefront %0d  observed:", k);
             for (int j = 0; j < COL; j++)
-                $write(" %5d", $signed(psum_hist[j][r0 + k + ROW + j]));
+                $write(" %5d", $signed(psum_hist[j][r0 + k + ROW + COL - 1]));
             $write("   golden:");
             for (int j = 0; j < COL; j++) $write(" %5d", gemm_gold[k][j]);
             $write("\n");

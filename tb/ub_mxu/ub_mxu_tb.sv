@@ -288,7 +288,7 @@ module ub_mxu_tb;
             for (int j = 0; j < COL; j++) begin
                 acc = 0;
                 for (int i = 0; i < ROW; i++)
-                    acc += W[i][j] * $signed(act_hist[i][c + 1 - ROW - j]);
+                    acc += W[i][j] * $signed(act_hist[i][c + 2 - ROW - COL]);
                 if ($signed(psum_hist[j][c]) !== acc) begin
                     sb_err++;
                     if (sb_err <= 6)
@@ -309,7 +309,7 @@ module ub_mxu_tb;
                 acc = 0;
                 for (int i = 0; i < ROW; i++) acc += W[i][j] * A[k][i];
                 gemm_gold[k][j] = acc;
-                cc = r0 + k + ROW + j;         // dot product lands here
+                cc = r0 + k + ROW + COL - 1;   // aligned wavefront lands here
                 checks++;
                 if ($signed(psum_hist[j][cc]) !== acc || !pvalid_hist[cc]) begin
                     errors++; gerr++;
@@ -328,7 +328,7 @@ module ub_mxu_tb;
         for (int k = 0; k < K; k++) begin
             $write("         wavefront %0d  observed:", k);
             for (int j = 0; j < COL; j++)
-                $write(" %5d", $signed(psum_hist[j][r0 + k + ROW + j]));
+                $write(" %5d", $signed(psum_hist[j][r0 + k + ROW + COL - 1]));
             $write("   golden:");
             for (int j = 0; j < COL; j++) $write(" %5d", gemm_gold[k][j]);
             $write("\n");
