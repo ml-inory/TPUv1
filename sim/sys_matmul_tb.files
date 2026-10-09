@@ -1,0 +1,8 @@
+../rtl/ub.sv
+../rtl/weight_fifo.sv
+../rtl/weight_reshape.sv
+../rtl/mxu_controller.sv
+../rtl/accumulator.sv
+../rtl/mxu/mxu.sv
+../rtl/mxu/pe.sv
+../rtl/mxu/delay_chain.sv
