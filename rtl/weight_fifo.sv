@@ -7,16 +7,16 @@ module WeightFIFO #(
     parameter WIDTH = 8,
     parameter DEPTH = 8 * 8
 ) (
-    input logic                     clk,
-    input logic                     rst,
+    input  logic                     clk,
+    input  logic                     rst,
     // write
-    input logic                     wr_en,
-    input logic [WIDTH*DEPTH-1:0]   wr_data,
-    output logic                    full,
+    input  logic                     wr_en,
+    input  logic [WIDTH*DEPTH-1:0]   wr_data,
+    output logic                     full,
     // read
-    input logic                     rd_en,
-    output logic [WIDTH*DEPTH-1:0]  rd_data,
-    output logic                    empty
+    input  logic                     rd_en,
+    output logic [WIDTH*DEPTH-1:0]   rd_data,
+    output logic                     empty
 );
     localparam LINE_SIZE = WIDTH * DEPTH;
     reg [LINE_SIZE-1:0] fifo [0:TILE-1];
