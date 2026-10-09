@@ -1,5 +1,6 @@
 //=============================================================================
-// UB + MXU + WeightFIFO + WeightReshape + MXU_Controller system testbench
+// UB + MXU + WeightFIFO + WeightReshape + MXU_Controller + Accumulator
+// system testbench
 //
 // This is the full controller-driven data path of the TPU:
 //   * acts   : UB (one line = one ROW-wide activation vector) -> MXU act ports
@@ -7,6 +8,10 @@
 //   * control: rtl/mxu_controller.sv runs IDLE -> LOAD_WEIGHT -> COMPUTE ->
 //              DRAIN -> DONE and drives load_weight / weight_rd_en / act_rd_en
 //              / act_in_valid, consuming weight_fifo_empty and psum_out_valid
+//   * result : rtl/accumulator.sv accumulates the psum stream of a round (K
+//              cycles of complete wavefronts) into K blocks and sums them, so
+//              dout holds the K-accumulated column result sum_k dot(A[k],W[:,j]);
+//              BLOCK_NUM = 2*K double buffers consecutive rounds
 //
 // The tb only orchestrates: it writes each round's activation image into UB
 // (and checks the read-back), prefetches weight tiles into the FIFO, pulses
@@ -52,6 +57,7 @@ module ub_mxu_wf_ctrl_tb;
     localparam int WT_WORDS     = ROW*COL;
     localparam int WF_LINE      = WEIGHT_WIDTH*WT_WORDS;
     localparam int WF_TILES     = 2;
+    localparam int ACC_BLOCKS   = 2*K;    // double buffer: K blocks per round
 
     localparam int CLK_PERIOD   = 10;
     localparam int MAXC         = 600;
@@ -93,6 +99,11 @@ module ub_mxu_wf_ctrl_tb;
     logic [ACC_WIDTH-1:0]     psum_in   [0:COL-1];
     logic                     psum_out_valid;
     logic [ACC_WIDTH-1:0]     psum_out  [0:COL-1];
+
+    // ---- Accumulator --------------------------------------------------------
+    logic [ACC_WIDTH-1:0]     acc_psum  [0:COL-1];
+    logic                     acc_valid;
+    logic [ACC_WIDTH-1:0]     acc_dout  [0:COL-1];
 
     // ---- act address glue --------------------------------------------------
     logic [UB_AW-1:0] act_addr;
@@ -183,6 +194,27 @@ module ub_mxu_wf_ctrl_tb;
         .done(ctrl_done)
     );
 
+    // MXU 的 psum_out 现在已按列对齐，psum_out_valid 表示这一拍 COL 个
+    // psum 都是同一个 wavefront 的结果，所以累加器可以直接接上去
+    Accumulator #(
+        .WIDTH(ACC_WIDTH), .COL(COL), .BLOCK_NUM(ACC_BLOCKS)
+    ) u_acc (
+        .clk(clk), .rst(rst),
+        .psum_valid(acc_valid), .psum(acc_psum), .dout(acc_dout)
+    );
+
+    // Icarus 不会把非打包数组输出口传到 tb 层数组，所以做一次层次化拷贝；
+    // 下降沿阻塞赋值等价于一条直连（累加器在上升沿采样）
+    initial begin
+        for (int j = 0; j < COL; j++) acc_psum[j] = '0;
+        acc_valid = 1'b0;
+        forever begin
+            @(negedge clk);
+            for (int j = 0; j < COL; j++) acc_psum[j] = u_mxu.psum_out[j];
+            acc_valid = u_mxu.psum_out_valid;
+        end
+    end
+
     // ---- clock / reset ------------------------------------------------------
     initial clk = 1'b0;
     always #(CLK_PERIOD/2) clk = ~clk;
@@ -198,6 +230,21 @@ module ub_mxu_wf_ctrl_tb;
     logic [ACC_WIDTH-1:0] psum_hist [0:COL-1][0:MAXC];
     bit                   pv_hist   [0:MAXC];
     logic [2:0]           st_hist   [0:MAXC];
+
+    // ---- golden helpers -----------------------------------------------------
+    function automatic int dot_r(input int r, input int k, input int j);
+        int acc;
+        acc = 0;
+        for (int i = 0; i < ROW; i++) acc += W[r][i][j] * A[r][k][i];
+        dot_r = acc;
+    endfunction
+
+    function automatic int ksum_r(input int r, input int j);
+        int acc;
+        acc = 0;
+        for (int k = 0; k < K; k++) acc += dot_r(r, k, j);
+        ksum_r = acc;
+    endfunction
 
     // ---- helpers -----------------------------------------------------------
     function automatic logic [ACT_LINE-1:0] act_line(input int r, input int k);
@@ -328,7 +375,16 @@ module ub_mxu_wf_ctrl_tb;
             st_hist[cyc] = u_ctrl.cur_state;
 
             if (u_ctrl.cur_state == S_COMP) begin
-                if (c0 < 0) c0 = cyc;
+                if (c0 < 0) begin
+                    c0 = cyc;
+                    // double buffered readout: while this round accumulates, dout
+                    // must still show the previous round's K-accumulated result
+                    if (r > 0)
+                        for (int j = 0; j < COL; j++)
+                            check_int($sformatf("round %0d: dout keeps round %0d result",
+                                                r, r-1),
+                                      $signed(u_acc.dout[j]), ksum_r(r-1, j));
+                end
                 n_comp++;
                 if (n_comp == 1) begin          // prefetch tile 2 during round 0
                     if (r == 0) begin
@@ -392,6 +448,28 @@ module ub_mxu_wf_ctrl_tb;
                 end
             end
         end
+
+        // accumulator: the K blocks written this round must hold the K aligned
+        // wavefronts, and dout must be their K-accumulated column sum
+        gerr = 0;
+        for (int m = 0; m < K; m++)
+            for (int j = 0; j < COL; j++) begin
+                checks++;
+                if ($signed(u_acc.acc[(r*K + m) % ACC_BLOCKS][j]) !== dot_r(r, m, j)) begin
+                    errors++; gerr++;
+                    if (gerr <= 6)
+                        $display("  [FAIL] round %0d acc block %0d col %0d: got=%0d exp=%0d",
+                                 r, (r*K + m) % ACC_BLOCKS, j,
+                                 $signed(u_acc.acc[(r*K + m) % ACC_BLOCKS][j]),
+                                 dot_r(r, m, j));
+                end
+            end
+        if (gerr == 0)
+            $display("  [PASS] %-50s (%0d blocks x %0d cols)",
+                     $sformatf("round %0d accumulated wavefronts", r), K, COL);
+        for (int j = 0; j < COL; j++)
+            check_int($sformatf("round %0d acc dout[%0d] == sum_k dot", r, j),
+                      $signed(u_acc.dout[j]), ksum_r(r, j));
     endtask
 
     // ---- waveform / watchdog -------------------------------------------------
